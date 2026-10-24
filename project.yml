@@ -1,0 +1,49 @@
+name: Emulsion
+options:
+  bundleIdPrefix: dev.julio
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    DEVELOPMENT_TEAM: 8B2FH8277F
+    CODE_SIGN_STYLE: Automatic
+targets:
+  Emulsion:
+    type: application
+    platform: iOS
+    sources:
+      - Emulsion
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.julio.emulsion
+        TARGETED_DEVICE_FAMILY: "1"
+        # Compile .metal files as Core Image kernels.
+        MTL_COMPILER_FLAGS: -fcikernel
+        MTLLINKER_FLAGS: -fcikernel
+    info:
+      path: Emulsion/Info.plist
+      properties:
+        CFBundleDisplayName: Emulsion
+        CFBundleShortVersionString: "0.6.0"
+        CFBundleVersion: "1"
+        LSRequiresIPhoneOS: true
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+        UIRequiresFullScreen: true
+        UIStatusBarHidden: true
+        UIUserInterfaceStyle: Dark
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSCameraUsageDescription: Emulsion needs the camera to take photos and video.
+        NSMicrophoneUsageDescription: Emulsion records sound with your video.
+        NSPhotoLibraryAddUsageDescription: Emulsion saves your photos to your library.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        ITSAppUsesNonExemptEncryption: false
+schemes:
+  Emulsion:
+    build:
+      targets:
+        Emulsion: all

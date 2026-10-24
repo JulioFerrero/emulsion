@@ -1,0 +1,5 @@
+.DS_Store
+build/
+DerivedData/
+*.xcodeproj/
+Emulsion/Info.plist
