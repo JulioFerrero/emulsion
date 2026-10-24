@@ -3,3 +3,4 @@ build/
 DerivedData/
 *.xcodeproj/
 Emulsion/Info.plist
+Config/Local.xcconfig

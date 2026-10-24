@@ -83,9 +83,11 @@ float4 grain(sample_t s, float amount, float size, float chroma, float2 seed, de
 }
 
 // Catmull-Rom resampling onto a finer grid, for super-resolution: output pixel p reads the source at
-// origin + p / scale. Sharper than bilinear, without Lanczos's ringing.
-float4 resample(sampler src, float2 origin, float scale, destination dest) {
-    float2 q = origin + dest.coord() / scale - 0.5;
+// m · p + offset, an affine that carries the zoom and the frame's alignment. Sharper than bilinear, without
+// Lanczos's ringing.
+float4 resample(sampler src, float4 m, float2 offset, destination dest) {
+    float2 c = dest.coord();
+    float2 q = float2(m.x * c.x + m.y * c.y, m.z * c.x + m.w * c.y) + offset - 0.5;
     float2 base = floor(q);
     float2 t = q - base;
     float2 t2 = t * t;

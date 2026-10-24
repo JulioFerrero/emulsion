@@ -52,9 +52,9 @@ Apple's RAW pipeline is bypassed. Every frame is developed from the sensor's Bay
 | | |
 |---|---|
 | **Development** | LJ92 DNG decoder · Malvar–He–Cutler demosaic · the DNG's own color matrices, interpolated in mireds and adapted to D65 · lens vignetting from the DNG's opcodes · chroma-only noise reduction |
-| **×4** | Four RAW frames merged: the light of an exposure two stops longer, handheld. Phase-correlation alignment (vDSP FFT, coarse to fine, sub-pixel), with Vision homography as a fallback. Low-pass agreement keeps moving things from ghosting. |
+| **×4** | Four RAW frames merged: the light of an exposure two stops longer, handheld. Phase correlation (vDSP FFT, coarse to fine, sub-pixel) on five patches, fitted with an affine for the hand's turn and the rolling shutter's skew, with Vision homography as a fallback. Low-pass agreement keeps moving things from ghosting. |
 | **HDR** | A −2 / 0 / +2 RAW bracket merged into one frame |
-| **35MM · 50MM** | A ×4 burst is rebuilt at full 12 MP from the hand's sub-pixel movement between frames, instead of a crop |
+| **35MM · 50MM** | A ×4 burst is merged onto a finer grid from the hand's sub-pixel movement, instead of enlarging a crop of one frame. Sharper than the crop, short of a true 12 MP frame: each frame is demosaiced before the merge. |
 | **Film** | OKLab grading · per-stock tone curve baked into a 3D LUT · grain measured in stops · halation · Pro-Mist style diffusion (1/8, 1/4, 1/2) |
 | **Speed** | ×4 in 2.1 s on the A9. The same burst through Apple's RAW filter took 8.7 s. |
 
@@ -81,7 +81,14 @@ xcodegen generate
 open Emulsion.xcodeproj
 ```
 
-Set `DEVELOPMENT_TEAM` in `project.yml` to your own team. A free Apple account works, but it has to re-sign the app every 7 days.
+To sign it for your phone, make `Config/Local.xcconfig` (git ignores it):
+
+```
+DEVELOPMENT_TEAM = ABCDE12345
+EMULSION_BUNDLE_ID = com.yourname.emulsion
+```
+
+A free Apple account works, but it has to re-sign the app every 7 days.
 
 Tuned on one iPhone 6s. The color calibration is fitted to that sensor.
 

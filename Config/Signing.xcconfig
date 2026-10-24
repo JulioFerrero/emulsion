@@ -1,0 +1,9 @@
+// Signing. To build for your own phone, make Config/Local.xcconfig (git ignores it) with your team,
+// and a bundle identifier of your own if this one is taken:
+//
+//   DEVELOPMENT_TEAM = ABCDE12345
+//   EMULSION_BUNDLE_ID = com.yourname.emulsion
+
+EMULSION_BUNDLE_ID = dev.julio.emulsion
+
+#include? "Local.xcconfig"

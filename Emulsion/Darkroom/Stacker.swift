@@ -20,8 +20,13 @@ enum Stacker {
     private static let agreementRadius = 3.0
     /// Long side of the copies Vision aligns, when correlation can't.
     private static let registrationSize: CGFloat = 1024
-    /// Global shift by phase correlation. Bursts move a few dozen pixels, so small patches do.
+    /// Phase correlation on small patches: bursts move a few dozen pixels.
     private static let correlator = PhaseCorrelator(size: 256)
+    /// Where the fine patches sit, as fractions of the frame: the middle, and in from each corner, so a turn of
+    /// the hand or the rolling shutter's skew shows up as the corners moving differently from the middle.
+    private static let anchors: [CGPoint] = [
+        CGPoint(x: 0.5, y: 0.5), CGPoint(x: 0.2, y: 0.2), CGPoint(x: 0.8, y: 0.2), CGPoint(x: 0.2, y: 0.8), CGPoint(x: 0.8, y: 0.8),
+    ]
     /// Agreement is judged on copies this much smaller: low-pass enough to ignore noise, sharp enough for motion.
     private static let lowScale: CGFloat = 0.25
     /// Below this the correlation peak isn't trusted and Vision aligns instead.
@@ -37,22 +42,24 @@ enum Stacker {
         let ref = frames[reference]
         let extent = ref.image.extent
         let crop = Framing.zoom(extent, factor: zoom)
-        // Where the zoomed grid reads a frame that sits `shift` away; and the same for low-pass copies.
-        func onGrid(_ image: CIImage, shift: CGPoint) -> CIImage {
+        // A frame on the output grid, given `warp` from reference to frame coordinates; and the same for
+        // low-pass copies.
+        func onGrid(_ image: CIImage, warp: CGAffineTransform) -> CIImage {
             guard zoom > 1 else {
-                return image.transformed(by: CGAffineTransform(translationX: -shift.x, y: -shift.y)).cropped(to: extent)
+                return image.transformed(by: warp.inverted()).cropped(to: extent)
             }
-            let origin = CGPoint(x: crop.minX + shift.x, y: crop.minY + shift.y)
+            // Output pixel p reads the frame at warp(crop origin + p / zoom).
+            let m = CGAffineTransform(scaleX: 1 / zoom, y: 1 / zoom)
+                .concatenating(CGAffineTransform(translationX: crop.minX, y: crop.minY))
+                .concatenating(warp)
             return FilmKernels.resample.apply(
                 extent: extent,
-                roiCallback: { _, rect in
-                    CGRect(x: origin.x + rect.minX / zoom - 2, y: origin.y + rect.minY / zoom - 2,
-                           width: rect.width / zoom + 4, height: rect.height / zoom + 4)
-                },
-                arguments: [image.clampedToExtent(), CIVector(x: origin.x, y: origin.y), Float(zoom)]) ?? image
+                roiCallback: { _, rect in rect.applying(m).insetBy(dx: -2, dy: -2) },
+                arguments: [image.clampedToExtent(), CIVector(x: m.a, y: m.c, z: m.b, w: m.d), CIVector(x: m.tx, y: m.ty)]) ?? image
         }
-        func lowOnGrid(_ low: CIImage, shift: CGPoint) -> CIImage {
-            low.transformed(by: CGAffineTransform(translationX: -crop.minX - shift.x, y: -crop.minY - shift.y)
+        func lowOnGrid(_ low: CIImage, warp: CGAffineTransform) -> CIImage {
+            low.transformed(by: warp.inverted()
+                .concatenating(CGAffineTransform(translationX: -crop.minX, y: -crop.minY))
                 .concatenating(CGAffineTransform(scaleX: zoom, y: zoom)))
                 .cropped(to: extent)
         }
@@ -72,10 +79,10 @@ enum Stacker {
         let refImage = image(refBuffer, extent: extent)
         render(lowPass(refImage), into: refLowBuffer, context: context)
         let refLowFull = upsampled(image(refLowBuffer, extent: .zero))
-        let refLow = lowOnGrid(refLowFull, shift: .zero)
-        let refOnGrid = zoom > 1 ? onGrid(refImage, shift: .zero) : refImage
+        let refLow = lowOnGrid(refLowFull, warp: .identity)
+        let refOnGrid = zoom > 1 ? onGrid(refImage, warp: .identity) : refImage
         let refCoarse = correlator.spectrum(patch(refImage, gain: 1, scale: 0.25, context: context))
-        let refFine = correlator.spectrum(patch(refImage, gain: 1, scale: 1, context: context))
+        let refFine = anchors.map { correlator.spectrum(patch(refImage, gain: 1, scale: 1, at: anchor($0, extent), context: context)) }
         var refSmallReady = false
         Timing.mark("reference developed")
 
@@ -93,13 +100,16 @@ enum Stacker {
                 Timing.mark("frame \(i + 1) developed")
                 let frameImage = image(frameBuffer, extent: extent)
                 let started = Date()
-                if let shift = correlate(frameImage, gain: gain, coarse: refCoarse, fine: refFine, context: context) {
-                    aligned = onGrid(frameImage, shift: shift)
+                if let (warp, patches) = correlate(frameImage, gain: gain, coarse: refCoarse, fine: refFine, context: context) {
+                    aligned = onGrid(frameImage, warp: warp)
                     // The low-pass copy of the aligned frame is the low-pass copy of the frame, moved the same.
                     render(lowPass(frameImage), into: frameLowBuffer, context: context)
-                    alignedLow = lowOnGrid(upsampled(image(frameLowBuffer, extent: .zero)), shift: shift)
-                    Timing.mark(String(format: "frame %d aligned in %.0f ms, moved %.1f, %.1f px",
-                                       i + 1, Date().timeIntervalSince(started) * 1000, shift.x, shift.y))
+                    alignedLow = lowOnGrid(upsampled(image(frameLowBuffer, extent: .zero)), warp: warp)
+                    let center = CGPoint(x: extent.midX, y: extent.midY)
+                    let moved = center.applying(warp)
+                    Timing.mark(String(format: "frame %d aligned in %.0f ms on %d patches, moved %.1f, %.1f px, turned %.2f°",
+                                       i + 1, Date().timeIntervalSince(started) * 1000, patches,
+                                       moved.x - center.x, moved.y - center.y, atan2(warp.b, warp.a) * 180 / .pi))
                 } else {
                     if !refSmallReady {
                         render(registrationImage(refImage, gain: 1, scale: scale), into: refSmall, context: context)
@@ -107,7 +117,7 @@ enum Stacker {
                     }
                     render(registrationImage(frameImage, gain: gain, scale: scale), into: frameSmall, context: context)
                     aligned = align(frameImage, small: frameSmall, to: refSmall, scale: scale, extent: extent)
-                        .map { zoom > 1 ? onGrid($0, shift: .zero) : $0 }
+                        .map { zoom > 1 ? onGrid($0, warp: .identity) : $0 }
                     alignedLow = aligned.map(blurred) ?? refLow
                     Timing.mark("frame \(i + 1) aligned by Vision")
                 }
@@ -127,22 +137,74 @@ enum Stacker {
         return FilmKernels.resolveMerge.apply(extent: extent, arguments: [merged, refOnGrid])
     }
 
-    /// How far the frame's content sits from the reference's, in Core Image pixels: coarse on a half-size
-    /// patch, then refined at full size. Nil when the match is too weak to trust.
+    /// Where the reference's content sits in the frame, as a map from reference to frame coordinates: a coarse
+    /// shift on a quarter-size patch, then sub-pixel matches at the middle and near each corner, fitted with
+    /// an affine (shift, turn, scale and rolling-shutter skew). Patches on flat sky or on something moving
+    /// drop out. Nil when even the coarse match is too weak to trust. Also returns how many patches it used.
     private static func correlate(_ frame: CIImage, gain: Double, coarse: PhaseCorrelator.Spectrum,
-                                  fine: PhaseCorrelator.Spectrum, context: CIContext) -> CGPoint? {
+                                  fine: [PhaseCorrelator.Spectrum], context: CIContext) -> (CGAffineTransform, Int)? {
         let first = correlator.offset(of: correlator.spectrum(patch(frame, gain: gain, scale: 0.25, context: context)), from: coarse)
         guard first.strength > minimumStrength else { return nil }
         // Patch rows run top down; Core Image's y runs up.
-        var shift = CGPoint(x: CGFloat(first.x) * 4, y: -CGFloat(first.y) * 4)
-        // The fine patch comes from the same place as the reference's, so what it measures is what's left.
+        let shift = CGPoint(x: CGFloat(first.x) * 4, y: -CGFloat(first.y) * 4)
+        // Fine patches come from the same places as the reference's, so what they measure is what's left.
         let moved = frame.transformed(by: CGAffineTransform(translationX: -shift.x, y: -shift.y))
-        let second = correlator.offset(of: correlator.spectrum(patch(moved, gain: gain, scale: 1, at: frame.extent, context: context)), from: fine)
-        if second.strength > minimumStrength, abs(second.x) < 6, abs(second.y) < 6 {
-            shift.x += CGFloat(second.x)
-            shift.y -= CGFloat(second.y)
+        var matches: [(from: CGPoint, to: CGPoint)] = []
+        for (spectrum, fraction) in zip(fine, anchors) {
+            let at = anchor(fraction, frame.extent)
+            let second = correlator.offset(of: correlator.spectrum(patch(moved, gain: gain, scale: 1, at: at, context: context)), from: spectrum)
+            if second.strength > minimumStrength, abs(second.x) < 6, abs(second.y) < 6 {
+                let c = CGPoint(x: at.midX, y: at.midY)
+                matches.append((c, CGPoint(x: c.x + shift.x + CGFloat(second.x), y: c.y + shift.y - CGFloat(second.y))))
+            }
         }
-        return shift
+        // Something moving through one patch disagrees with the rest: drop the worst while it's out by a pixel.
+        var warp = fitAffine(matches)
+        while let fitted = warp, matches.count > 3 {
+            let errors = matches.map { hypot($0.from.applying(fitted).x - $0.to.x, $0.from.applying(fitted).y - $0.to.y) }
+            guard let worst = errors.indices.max(by: { errors[$0] < errors[$1] }), errors[worst] > 1 else { break }
+            matches.remove(at: worst)
+            warp = fitAffine(matches)
+        }
+        // A hand turns a fraction of a degree in a burst; anything far from that is a bad fit.
+        if let fitted = warp, abs(fitted.a - 1) < 0.02, abs(fitted.d - 1) < 0.02, abs(fitted.b) < 0.02, abs(fitted.c) < 0.02 {
+            return (fitted, matches.count)
+        }
+        // Too few patches to fit a turn: shift by what they agree on, or the coarse match alone.
+        let mean = matches.isEmpty ? .zero : CGPoint(
+            x: matches.map { $0.to.x - $0.from.x }.reduce(0, +) / CGFloat(matches.count) - shift.x,
+            y: matches.map { $0.to.y - $0.from.y }.reduce(0, +) / CGFloat(matches.count) - shift.y)
+        return (CGAffineTransform(translationX: shift.x + mean.x, y: shift.y + mean.y), matches.count)
+    }
+
+    /// Least-squares affine through point matches, nil for fewer than three or for points in a line.
+    private static func fitAffine(_ matches: [(from: CGPoint, to: CGPoint)]) -> CGAffineTransform? {
+        guard matches.count >= 3 else { return nil }
+        // Centered, so the normal equations stay well conditioned at 4000-pixel coordinates.
+        let n = Double(matches.count)
+        let cx = matches.map { Double($0.from.x) }.reduce(0, +) / n
+        let cy = matches.map { Double($0.from.y) }.reduce(0, +) / n
+        var normal = simd_double3x3()
+        var u = SIMD3<Double>.zero, v = SIMD3<Double>.zero
+        for m in matches {
+            let p = SIMD3(Double(m.from.x) - cx, Double(m.from.y) - cy, 1)
+            normal += simd_double3x3(columns: (p * p.x, p * p.y, p * p.z))
+            u += p * Double(m.to.x)
+            v += p * Double(m.to.y)
+        }
+        guard abs(normal.determinant) > 1e-6 * pow(normal[0][0] + normal[1][1], 2) else { return nil }
+        let x = normal.inverse * u
+        let y = normal.inverse * v
+        // x' = x.x (X − cx) + x.y (Y − cy) + x.z, likewise y'.
+        return CGAffineTransform(a: x.x, b: y.x, c: x.y, d: y.y,
+                                 tx: x.z - x.x * cx - x.y * cy, ty: y.z - y.x * cx - y.y * cy)
+    }
+
+    /// A patch-sized rect centered at `fraction` of `extent`.
+    private static func anchor(_ fraction: CGPoint, _ extent: CGRect) -> CGRect {
+        let side = CGFloat(correlator.size)
+        return CGRect(x: extent.minX + extent.width * fraction.x - side / 2, y: extent.minY + extent.height * fraction.y - side / 2,
+                      width: side, height: side)
     }
 
     /// The middle of `frame` (the image's own extent unless given) at `scale`, exposure-matched, clamped and

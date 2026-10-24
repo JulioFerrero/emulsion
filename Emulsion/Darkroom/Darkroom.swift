@@ -1,4 +1,5 @@
 import CoreImage
+import Darwin
 import ImageIO
 import Metal
 import Photos
@@ -64,7 +65,48 @@ final class Darkroom {
         }
     }
 
-    /// Gives the working memory back when the app leaves the screen.
+    /// With a `lab` folder in Documents, every burst also keeps its mosaics there, for measuring the stacker
+    /// on the Mac: each frame's raw sensor values, its size and exposure, and the reference's DNG.
+    private func saveForLab(_ photo: CapturedPhoto) {
+        guard photo.frames.count > 1,
+              let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let lab = documents.appendingPathComponent("lab")
+        var isFolder: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: lab.path, isDirectory: &isFolder), isFolder.boolValue else { return }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let folder = lab.appendingPathComponent(formatter.string(from: Date()))
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        for (i, frame) in photo.frames.enumerated() {
+            if let raw = frame.raw {
+                try? raw.write(to: folder.appendingPathComponent("frame-\(i).dng"))
+            }
+            guard let bayer = frame.bayer else { continue }
+            try? bayer.data.write(to: folder.appendingPathComponent("frame-\(i).bayer"))
+            let info: [String: Any] = ["width": bayer.width, "height": bayer.height, "rowBytes": bayer.rowBytes, "exposure": frame.exposure]
+            try? JSONSerialization.data(withJSONObject: info).write(to: folder.appendingPathComponent("frame-\(i).json"))
+        }
+        Timing.mark("burst kept for the lab")
+    }
+
+    /// The working buffers stay between photos only while iOS has room to spare: on a 2 GB phone with
+    /// Photos or Safari behind, holding on to them could get the app killed.
+    private func checkMemory() {
+        let available = Double(os_proc_available_memory()) / 1_048_576
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let footprint = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
+        } == KERN_SUCCESS ? Double(info.phys_footprint) / 1_048_576 : 0
+        let release = available < 300
+        Timing.mark(String(format: "memory %.0f MB used, %.0f MB to spare%@", footprint, available, release ? ", letting buffers go" : ""))
+        if release {
+            Stacker.releaseBuffers()
+            isWarm = false
+        }
+    }
+
+    /// Gives the working memory back when the app leaves the screen, or when iOS asks for it.
     func releaseMemory() {
         queue.async {
             Stacker.releaseBuffers()
@@ -78,6 +120,8 @@ final class Darkroom {
             let report: (Float) -> Void = { value in DispatchQueue.main.async { progress(value) } }
             let thumbnail = autoreleasepool { self.process(photo, roll: roll, progress: report) }
             Timing.mark("done")
+            self.checkMemory()
+            self.saveForLab(photo)
             DispatchQueue.main.async { completion(thumbnail) }
         }
     }

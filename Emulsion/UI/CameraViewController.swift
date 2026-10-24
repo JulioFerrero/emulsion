@@ -155,6 +155,7 @@ final class CameraViewController: UIViewController {
         let center = NotificationCenter.default
         center.addObserver(self, selector: #selector(appWillResignActive), name: UIApplication.willResignActiveNotification, object: nil)
         center.addObserver(self, selector: #selector(appDidBecomeActive), name: UIApplication.didBecomeActiveNotification, object: nil)
+        center.addObserver(self, selector: #selector(memoryWarning), name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -1109,6 +1110,11 @@ final class CameraViewController: UIViewController {
         darkroom.releaseMemory()
         camera.pause()
         orientation.stop()
+    }
+
+    @objc private func memoryWarning() {
+        Timing.mark("memory warning")
+        darkroom.releaseMemory()
     }
 
     @objc private func appDidBecomeActive() {
