@@ -71,7 +71,20 @@ Apple's RAW pipeline is bypassed. Every frame is developed from the sensor's Bay
 
 ## Camera
 
-Manual focus on a distance scale, from 10 cm to ∞ · shutter speeds from 1/8000 to 1/3 s · EV by dragging the frame · 135, 645, 6×6 and XPAN frames · an 85 filter for tungsten stocks in daylight · pull one stop or push two · keep the DNG negative alongside the print
+<table>
+<tr>
+<td width="42%"><img src="docs/screen.jpg" alt="The camera screen: MONO 400 with an orange filter, 6×6 at 50MM"></td>
+<td>
+Manual focus on a distance scale, 10 cm to ∞<br><br>
+Shutter speeds from 1/8000 to 1/3 s<br><br>
+EV by dragging the frame<br><br>
+<code>135</code> <code>645</code> <code>6×6</code> <code>XPAN</code> frames<br><br>
+An 85 filter for tungsten stocks in daylight<br><br>
+Pull one stop or push two<br><br>
+The DNG negative kept alongside the print
+</td>
+</tr>
+</table>
 
 ## Build
 
