@@ -82,7 +82,7 @@ enum Stacker {
         let refLow = lowOnGrid(refLowFull, warp: .identity)
         let refOnGrid = zoom > 1 ? onGrid(refImage, warp: .identity) : refImage
         let refCoarse = correlator.spectrum(patch(refImage, gain: 1, scale: 0.25, context: context))
-        let refFine = anchors.map { correlator.spectrum(patch(refImage, gain: 1, scale: 1, at: anchor($0, extent), context: context)) }
+        let refFine = patches(refImage, gain: 1, at: anchors.map { anchor($0, extent) }, context: context).map(correlator.spectrum)
         var refSmallReady = false
         Timing.mark("reference developed")
 
@@ -150,9 +150,9 @@ enum Stacker {
         // Fine patches come from the same places as the reference's, so what they measure is what's left.
         let moved = frame.transformed(by: CGAffineTransform(translationX: -shift.x, y: -shift.y))
         var matches: [(from: CGPoint, to: CGPoint)] = []
-        for (spectrum, fraction) in zip(fine, anchors) {
-            let at = anchor(fraction, frame.extent)
-            let second = correlator.offset(of: correlator.spectrum(patch(moved, gain: gain, scale: 1, at: at, context: context)), from: spectrum)
+        let rects = anchors.map { anchor($0, frame.extent) }
+        for (at, (samples, spectrum)) in zip(rects, zip(patches(moved, gain: gain, at: rects, context: context), fine)) {
+            let second = correlator.offset(of: correlator.spectrum(samples), from: spectrum)
             if second.strength > minimumStrength, abs(second.x) < 6, abs(second.y) < 6 {
                 let c = CGPoint(x: at.midX, y: at.midY)
                 matches.append((c, CGPoint(x: c.x + shift.x + CGFloat(second.x), y: c.y + shift.y - CGFloat(second.y))))
@@ -221,6 +221,37 @@ enum Stacker {
             context.render(small, toBitmap: $0.baseAddress!, rowBytes: side * 16, bounds: rect, format: .RGBAf, colorSpace: nil)
         }
         return pixels.map(\.y)
+    }
+
+    /// Full-size patches at each of `rects`, side by side in one render: each render waits on the GPU, and on
+    /// the A9 the wait costs more than the patch.
+    private static func patches(_ image: CIImage, gain: Double, at rects: [CGRect], context: CIContext) -> [[Float]] {
+        let side = correlator.size
+        let source = registrationImage(image, gain: gain, scale: 1)
+        var strip = CIImage.empty()
+        for (i, rect) in rects.enumerated() {
+            let origin = CGPoint(x: rect.midX.rounded() - CGFloat(side / 2), y: rect.midY.rounded() - CGFloat(side / 2))
+            let tile = CGRect(origin: origin, size: CGSize(width: side, height: side))
+            strip = source.cropped(to: tile)
+                .transformed(by: CGAffineTransform(translationX: CGFloat(i * side) - origin.x, y: -origin.y))
+                .composited(over: strip)
+        }
+        let width = side * rects.count
+        var pixels = [SIMD4<Float>](repeating: .zero, count: width * side)
+        pixels.withUnsafeMutableBytes {
+            context.render(strip, toBitmap: $0.baseAddress!, rowBytes: width * 16,
+                           bounds: CGRect(x: 0, y: 0, width: width, height: side), format: .RGBAf, colorSpace: nil)
+        }
+        var out = [[Float]](repeating: [Float](repeating: 0, count: side * side), count: rects.count)
+        for i in rects.indices {
+            for row in 0..<side {
+                let start = row * width + i * side
+                for x in 0..<side {
+                    out[i][row * side + x] = pixels[start + x].y
+                }
+            }
+        }
+        return out
     }
 
     /// Warps `frame` onto the reference with a homography found on the small copies.
