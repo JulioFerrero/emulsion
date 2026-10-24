@@ -119,3 +119,7 @@ Mac command-line tools that run the app's own darkroom code on DNGs, for tuning 
 xcrun -sdk macosx swiftc -O Tools/FilmLab/main.swift Emulsion/Film/FilmStock.swift Emulsion/Film/FilmModel.swift -o build/filmlab
 build/filmlab out/ negatives/*.dng
 ```
+
+## License
+
+MIT. The film stock names are their makers' trademarks, used here to describe the looks.
