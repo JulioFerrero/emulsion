@@ -1,7 +1,9 @@
 import Accelerate
 
 /// Global translation between two frames by phase correlation: whiten the cross-power spectrum of two
-/// patches and the inverse transform peaks at their offset. A 512×512 patch takes milliseconds on the CPU.
+/// patches and the inverse transform peaks at their offset. With a `bandwidth`, only frequencies up to
+/// about that many cycles across the patch are trusted: in a high-ISO frame the finest detail is mostly
+/// noise, and its random phase buries the peak. A 512×512 patch takes milliseconds on the CPU.
 final class PhaseCorrelator {
     struct Spectrum {
         fileprivate var real: [Float]
@@ -13,14 +15,24 @@ final class PhaseCorrelator {
     private let log2n: vDSP_Length
     private let setup: FFTSetup
     private let window: [Float]
+    private let band: [Float]?
+    private let bandSum: Float
 
-    init(size: Int = 512) {
+    init(size: Int = 512, bandwidth: Float? = nil) {
         self.size = size
         log2n = vDSP_Length(log2(Double(size)).rounded())
         setup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2))!
         // A Hann window, so the patch's edges don't correlate with each other.
         let line = (0..<size).map { 0.5 - 0.5 * cos(2 * Float.pi * (Float($0) + 0.5) / Float(size)) }
         window = (0..<size * size).map { line[$0 % size] * line[$0 / size] }
+        band = bandwidth.map { width in
+            (0..<size * size).map { k in
+                let fx = Float(k % size < size / 2 ? k % size : k % size - size)
+                let fy = Float(k / size < size / 2 ? k / size : k / size - size)
+                return exp(-(fx * fx + fy * fy) / (2 * width * width))
+            }
+        }
+        bandSum = band?.reduce(0, +) ?? Float(size * size)
     }
 
     deinit {
@@ -46,8 +58,9 @@ final class PhaseCorrelator {
             let re = reference.real[k] * moving.real[k] + reference.imag[k] * moving.imag[k]
             let im = reference.real[k] * moving.imag[k] - reference.imag[k] * moving.real[k]
             let magnitude = max((re * re + im * im).squareRoot(), 1e-20)
-            real[k] = re / magnitude
-            imag[k] = im / magnitude
+            let weight = band?[k] ?? 1
+            real[k] = re / magnitude * weight
+            imag[k] = im / magnitude * weight
         }
         transform(&real, &imag, direction: kFFTDirection_Inverse)
 
@@ -57,16 +70,22 @@ final class PhaseCorrelator {
         let px = Int(index) % size
         let py = Int(index) / size
         func at(_ x: Int, _ y: Int) -> Float { real[((y + size) % size) * size + (x + size) % size] }
-        // Parabola through the peak and its neighbours, for the sub-pixel part.
+        // Parabola through the peak and its neighbours, for the sub-pixel part. The band makes the peak a
+        // Gaussian, whose middle a parabola through the logs finds exactly.
+        let gaussian = band != nil
         func refine(_ minus: Float, _ center: Float, _ plus: Float) -> Float {
-            let denominator = minus - 2 * center + plus
-            return abs(denominator) < 1e-12 ? 0 : 0.5 * (minus - plus) / denominator
+            var (a, b, c) = (minus, center, plus)
+            if gaussian, a > 0, b > 0, c > 0 {
+                (a, b, c) = (log(a), log(b), log(c))
+            }
+            let denominator = a - 2 * b + c
+            return abs(denominator) < 1e-12 ? 0 : 0.5 * (a - c) / denominator
         }
         var x = Float(px) + refine(at(px - 1, py), peak, at(px + 1, py))
         var y = Float(py) + refine(at(px, py - 1), peak, at(px, py + 1))
         if x > Float(size / 2) { x -= Float(size) }
         if y > Float(size / 2) { y -= Float(size) }
-        return (x, y, peak / Float(n))
+        return (x, y, peak / bandSum)
     }
 
     private func transform(_ real: inout [Float], _ imag: inout [Float], direction: Int) {

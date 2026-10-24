@@ -52,7 +52,7 @@ Apple's RAW pipeline is bypassed. Every frame is developed from the sensor's Bay
 | | |
 |---|---|
 | **Development** | LJ92 DNG decoder · Malvar–He–Cutler demosaic · the DNG's own color matrices, interpolated in mireds and adapted to D65 · lens vignetting from the DNG's opcodes · chroma-only noise reduction |
-| **×4** | Four RAW frames merged: the light of an exposure two stops longer, handheld. Phase correlation (vDSP FFT, coarse to fine, sub-pixel) on five patches, fitted with an affine for the hand's turn and the rolling shutter's skew, with Vision homography as a fallback. Low-pass agreement keeps moving things from ghosting. |
+| **×4** | Four RAW frames merged: the light of an exposure two stops longer, handheld. Five patches are found by band-limited phase correlation (vDSP FFT), refined to a fraction of a pixel by Lucas–Kanade, and fitted with an affine weighted by each patch's precision, for the hand's turn and the rolling shutter's skew. Vision homography is the fallback. Low-pass agreement keeps moving things from ghosting. |
 | **HDR** | A −2 / 0 / +2 RAW bracket merged into one frame |
 | **35MM · 50MM** | A ×4 burst is merged onto a finer grid from the hand's sub-pixel movement, instead of enlarging a crop of one frame. Sharper than the crop, short of a true 12 MP frame: each frame is demosaiced before the merge. |
 | **Film** | OKLab grading · per-stock tone curve baked into a 3D LUT · grain measured in stops · halation · Pro-Mist style diffusion (1/8, 1/4, 1/2) |

@@ -20,9 +20,16 @@ enum Stacker {
     private static let agreementRadius = 3.0
     /// Long side of the copies Vision aligns, when correlation can't.
     private static let registrationSize: CGFloat = 1024
-    /// Phase correlation on small patches: bursts move a few dozen pixels.
+    /// Phase correlation on small patches: bursts move a few dozen pixels. The whole frame's shift at quarter
+    /// size; each anchor's at half size, band-limited against noise.
     private static let correlator = PhaseCorrelator(size: 256)
-    /// Where the fine patches sit, as fractions of the frame: the middle, and in from each corner, so a turn of
+    private static let anchorCorrelator = PhaseCorrelator(size: 256, bandwidth: 16)
+    /// Lucas–Kanade patches: 256 pixels with room to move, blurred so noise doesn't steer them. Noise in the
+    /// gradients shortens every step; at high ISO with less blur than this the corners never settled.
+    private static let fineMargin = 8
+    private static let fineSide = 256 + 2 * fineMargin
+    private static let fineBlur = 3.0
+    /// Where the patches sit, as fractions of the frame: the middle, and in from each corner, so a turn of
     /// the hand or the rolling shutter's skew shows up as the corners moving differently from the middle.
     private static let anchors: [CGPoint] = [
         CGPoint(x: 0.5, y: 0.5), CGPoint(x: 0.2, y: 0.2), CGPoint(x: 0.8, y: 0.2), CGPoint(x: 0.2, y: 0.8), CGPoint(x: 0.8, y: 0.8),
@@ -81,8 +88,13 @@ enum Stacker {
         let refLowFull = upsampled(image(refLowBuffer, extent: .zero))
         let refLow = lowOnGrid(refLowFull, warp: .identity)
         let refOnGrid = zoom > 1 ? onGrid(refImage, warp: .identity) : refImage
-        let refCoarse = correlator.spectrum(patch(refImage, gain: 1, scale: 0.25, context: context))
-        let refFine = patches(refImage, gain: 1, at: anchors.map { anchor($0, extent) }, context: context).map(correlator.spectrum)
+        let centers = anchorCenters(extent)
+        let refTiles = tiles([Tile(image: refImage, gain: 1, scale: 0.25, center: middle(extent))]
+            + centers.map { Tile(image: refImage, gain: 1, scale: 0.5, center: $0) }, side: correlator.size, context: context)
+        let refCoarse = correlator.spectrum(refTiles[0])
+        let refAnchors = refTiles.dropFirst().map(anchorCorrelator.spectrum)
+        let refFine = tiles(centers.map { Tile(image: refImage, gain: 1, scale: 1, center: $0, blur: fineBlur) },
+                            side: fineSide, context: context)
         var refSmallReady = false
         Timing.mark("reference developed")
 
@@ -100,7 +112,8 @@ enum Stacker {
                 Timing.mark("frame \(i + 1) developed")
                 let frameImage = image(frameBuffer, extent: extent)
                 let started = Date()
-                if let (warp, patches) = correlate(frameImage, gain: gain, coarse: refCoarse, fine: refFine, context: context) {
+                if let (warp, patches) = correlate(frameImage, gain: gain, coarse: refCoarse, anchors: refAnchors,
+                                                   fine: refFine, context: context) {
                     aligned = onGrid(frameImage, warp: warp)
                     // The low-pass copy of the aligned frame is the low-pass copy of the frame, moved the same.
                     render(lowPass(frameImage), into: frameLowBuffer, context: context)
@@ -137,113 +150,259 @@ enum Stacker {
         return FilmKernels.resolveMerge.apply(extent: extent, arguments: [merged, refOnGrid])
     }
 
-    /// Where the reference's content sits in the frame, as a map from reference to frame coordinates: a coarse
-    /// shift on a quarter-size patch, then sub-pixel matches at the middle and near each corner, fitted with
-    /// an affine (shift, turn, scale and rolling-shutter skew). Patches on flat sky or on something moving
-    /// drop out. Nil when even the coarse match is too weak to trust. Also returns how many patches it used.
+    private struct Match {
+        var from: CGPoint
+        var to: CGPoint
+        /// Inverse covariance of `to`, per square pixel: a patch of vertical curtain folds pins down x and
+        /// says little about y.
+        var information: simd_double2x2
+    }
+
+    /// Where the reference's content sits in the frame, as a map from reference to frame coordinates.
+    /// Each anchor patch is found on its own at half size, so a turn of the hand that moves the corners
+    /// differently from the middle is still caught, then refined to a fraction of a pixel by Lucas–Kanade at
+    /// full size. Four or more matches give an affine (shift, turn, scale, rolling-shutter skew); fewer, the
+    /// middle's shift. Nil when nothing matches. Also returns how many patches it used.
     private static func correlate(_ frame: CIImage, gain: Double, coarse: PhaseCorrelator.Spectrum,
-                                  fine: [PhaseCorrelator.Spectrum], context: CIContext) -> (CGAffineTransform, Int)? {
-        let first = correlator.offset(of: correlator.spectrum(patch(frame, gain: gain, scale: 0.25, context: context)), from: coarse)
-        guard first.strength > minimumStrength else { return nil }
+                                  anchors refAnchors: [PhaseCorrelator.Spectrum], fine refFine: [[Float]],
+                                  context: CIContext) -> (CGAffineTransform, Int)? {
+        let centers = anchorCenters(frame.extent)
+        let first = tiles([Tile(image: frame, gain: gain, scale: 0.25, center: middle(frame.extent))]
+            + centers.map { Tile(image: frame, gain: gain, scale: 0.5, center: $0) }, side: correlator.size, context: context)
         // Patch rows run top down; Core Image's y runs up.
-        let shift = CGPoint(x: CGFloat(first.x) * 4, y: -CGFloat(first.y) * 4)
-        // Fine patches come from the same places as the reference's, so what they measure is what's left.
-        let moved = frame.transformed(by: CGAffineTransform(translationX: -shift.x, y: -shift.y))
-        var matches: [(from: CGPoint, to: CGPoint)] = []
-        let rects = anchors.map { anchor($0, frame.extent) }
-        for (at, (samples, spectrum)) in zip(rects, zip(patches(moved, gain: gain, at: rects, context: context), fine)) {
-            let second = correlator.offset(of: correlator.spectrum(samples), from: spectrum)
-            if second.strength > minimumStrength, abs(second.x) < 6, abs(second.y) < 6 {
-                let c = CGPoint(x: at.midX, y: at.midY)
-                matches.append((c, CGPoint(x: c.x + shift.x + CGFloat(second.x), y: c.y + shift.y - CGFloat(second.y))))
-            }
+        let global = correlator.offset(of: correlator.spectrum(first[0]), from: coarse)
+        let shift: CGPoint? = global.strength > minimumStrength ? CGPoint(x: CGFloat(global.x) * 4, y: -CGFloat(global.y) * 4) : nil
+        // Each anchor's own coarse match, unless it's weak or far from the frame's: then the frame's.
+        let starts: [CGPoint?] = centers.indices.map { i in
+            let m = anchorCorrelator.offset(of: anchorCorrelator.spectrum(first[i + 1]), from: refAnchors[i])
+            let own = CGPoint(x: CGFloat(m.x) * 2, y: -CGFloat(m.y) * 2)
+            let agrees = shift.map { hypot(own.x - $0.x, own.y - $0.y) < 32 } ?? true
+            let start = m.strength > minimumStrength && abs(m.x) < 64 && abs(m.y) < 64 && agrees ? own : shift
+            return start.map { CGPoint(x: $0.x.rounded(), y: $0.y.rounded()) }
         }
-        // Something moving through one patch disagrees with the rest: drop the worst while it's out by a pixel.
-        var warp = fitAffine(matches)
-        while let fitted = warp, matches.count > 3 {
-            let errors = matches.map { hypot($0.from.applying(fitted).x - $0.to.x, $0.from.applying(fitted).y - $0.to.y) }
-            guard let worst = errors.indices.max(by: { errors[$0] < errors[$1] }), errors[worst] > 1 else { break }
-            matches.remove(at: worst)
-            warp = fitAffine(matches)
+        let tracked = centers.indices.filter { starts[$0] != nil }
+        let moving = tiles(tracked.map { i in
+            Tile(image: frame, gain: gain, scale: 1, center: CGPoint(x: centers[i].x + starts[i]!.x, y: centers[i].y + starts[i]!.y),
+                 blur: fineBlur)
+        }, side: fineSide, context: context)
+        var matches: [(anchor: Int, match: Match)] = []
+        for (k, i) in tracked.enumerated() {
+            guard let (d, w) = refine(refFine[i], moving[k]) else { continue }
+            // Back to Core Image's upward y.
+            let information = simd_double2x2(rows: [SIMD2(w[0][0], -w[0][1]), SIMD2(-w[1][0], w[1][1])])
+            let to = CGPoint(x: centers[i].x + starts[i]!.x + CGFloat(d.x), y: centers[i].y + starts[i]!.y - CGFloat(d.y))
+            matches.append((i, Match(from: centers[i], to: to, information: information)))
+        }
+
+        // Something moving through a patch disagrees with the rest: drop the worst while it's far outside what
+        // its own precision allows, keeping four for the fit.
+        var used = matches
+        var warp = fitAffine(used.map(\.match))
+        while let fitted = warp, used.count > 4 {
+            let misses = used.map { m -> Double in
+                let p = m.match.from.applying(fitted)
+                let r = SIMD2(Double(p.x - m.match.to.x), Double(p.y - m.match.to.y))
+                return simd_length(r) < 0.3 ? 0 : simd_dot(r, m.match.information * r)
+            }
+            guard let worst = misses.indices.max(by: { misses[$0] < misses[$1] }), misses[worst] > 16 else { break }
+            used.remove(at: worst)
+            warp = fitAffine(used.map(\.match))
         }
         // A hand turns a fraction of a degree in a burst; anything far from that is a bad fit.
         if let fitted = warp, abs(fitted.a - 1) < 0.02, abs(fitted.d - 1) < 0.02, abs(fitted.b) < 0.02, abs(fitted.c) < 0.02 {
-            return (fitted, matches.count)
+            return (fitted, used.count)
         }
-        // Too few patches to fit a turn: shift by what they agree on, or the coarse match alone.
-        let mean = matches.isEmpty ? .zero : CGPoint(
-            x: matches.map { $0.to.x - $0.from.x }.reduce(0, +) / CGFloat(matches.count) - shift.x,
-            y: matches.map { $0.to.y - $0.from.y }.reduce(0, +) / CGFloat(matches.count) - shift.y)
-        return (CGAffineTransform(translationX: shift.x + mean.x, y: shift.y + mean.y), matches.count)
+        // Too few to fit a turn: the middle's shift, else the median of the others, else the frame's.
+        let offsets = matches.map { CGPoint(x: $0.match.to.x - $0.match.from.x, y: $0.match.to.y - $0.match.from.y) }
+        if let middle = matches.firstIndex(where: { $0.anchor == 0 }) {
+            return (CGAffineTransform(translationX: offsets[middle].x, y: offsets[middle].y), 1)
+        }
+        if !offsets.isEmpty {
+            let xs = offsets.map(\.x).sorted(), ys = offsets.map(\.y).sorted()
+            return (CGAffineTransform(translationX: xs[xs.count / 2], y: ys[ys.count / 2]), offsets.count)
+        }
+        return shift.map { (CGAffineTransform(translationX: $0.x, y: $0.y), 0) }
     }
 
-    /// Least-squares affine through point matches, nil for fewer than three or for points in a line.
-    private static func fitAffine(_ matches: [(from: CGPoint, to: CGPoint)]) -> CGAffineTransform? {
-        guard matches.count >= 3 else { return nil }
+    /// Lucas–Kanade: the sub-pixel offset at which `moving` best matches `reference`, both fineSide square and
+    /// row by row, compared over the middle 256. Returns the offset in patch pixels (y down) and its inverse
+    /// covariance, or nil for a flat patch or one that doesn't settle.
+    private static func refine(_ reference: [Float], _ moving: [Float]) -> (SIMD2<Double>, simd_double2x2)? {
+        let side = fineSide, m = fineMargin, inner = fineSide - 2 * fineMargin
+        let count = inner * inner
+        var gx = [Float](repeating: 0, count: count), gy = [Float](repeating: 0, count: count), r = [Float](repeating: 0, count: count)
+        var hxx = 0.0, hxy = 0.0, hyy = 0.0
+        reference.withUnsafeBufferPointer { ref in
+            for y in 0..<inner {
+                for x in 0..<inner {
+                    let i = (y + m) * side + x + m
+                    let k = y * inner + x
+                    gx[k] = 0.5 * (ref[i + 1] - ref[i - 1])
+                    gy[k] = 0.5 * (ref[i + side] - ref[i - side])
+                    r[k] = ref[i]
+                    hxx += Double(gx[k] * gx[k]); hxy += Double(gx[k] * gy[k]); hyy += Double(gy[k] * gy[k])
+                }
+            }
+        }
+        let h = simd_double2x2(rows: [SIMD2(hxx, hxy), SIMD2(hxy, hyy)])
+        guard h.determinant > 1e-12 * (hxx + hyy) * (hxx + hyy) else { return nil }
+        let inverse = h.inverse
+        var d = SIMD2<Double>.zero
+        var variance = 0.0
+        var settled = false
+        moving.withUnsafeBufferPointer { mov in
+            for _ in 0..<30 {
+                let ox = Int(d.x.rounded(.down)), oy = Int(d.y.rounded(.down))
+                let fx = Float(d.x) - Float(ox), fy = Float(d.y) - Float(oy)
+                let (w00, w10, w01, w11) = ((1 - fx) * (1 - fy), fx * (1 - fy), (1 - fx) * fy, fx * fy)
+                var errors = [Float](repeating: 0, count: count)
+                var mean = 0.0
+                for y in 0..<inner {
+                    for x in 0..<inner {
+                        let i = (y + m + oy) * side + x + m + ox
+                        let k = y * inner + x
+                        let sample = w00 * mov[i] + w10 * mov[i + 1] + w01 * mov[i + side] + w11 * mov[i + side + 1]
+                        errors[k] = sample - r[k]
+                        mean += Double(errors[k])
+                    }
+                }
+                // A brightness difference between frames isn't movement.
+                mean /= Double(count)
+                var b = SIMD2<Double>.zero
+                variance = 0
+                for k in 0..<count {
+                    let e = Double(errors[k]) - mean
+                    b += SIMD2(Double(gx[k]) * e, Double(gy[k]) * e)
+                    variance += e * e
+                }
+                variance /= Double(count)
+                let step = inverse * b
+                d -= step
+                guard abs(d.x) < Double(m - 1), abs(d.y) < Double(m - 1) else { return }
+                if simd_length(step) < 0.003 {
+                    settled = true
+                    return
+                }
+            }
+        }
+        guard settled else { return nil }
+        // Blurred noise is correlated over about 4π σ² pixels, so the patch has that many fewer independent samples.
+        let information = h * (1 / (max(variance, 1e-10) * 4 * .pi * fineBlur * fineBlur))
+        return (d, information)
+    }
+
+    /// Weighted least-squares affine through the matches, each counted by its own precision in each direction.
+    /// Nil for fewer than four. A weak pull toward no turn keeps a fit that the patches leave loose in one
+    /// direction from wandering.
+    private static func fitAffine(_ matches: [Match]) -> CGAffineTransform? {
+        guard matches.count >= 4 else { return nil }
         // Centered, so the normal equations stay well conditioned at 4000-pixel coordinates.
         let n = Double(matches.count)
         let cx = matches.map { Double($0.from.x) }.reduce(0, +) / n
         let cy = matches.map { Double($0.from.y) }.reduce(0, +) / n
-        var normal = simd_double3x3()
-        var u = SIMD3<Double>.zero, v = SIMD3<Double>.zero
+        // Unknowns a, c, tx, b, d, ty: x' = a X + c Y + tx, y' = b X + d Y + ty.
+        var normal = [[Double]](repeating: [Double](repeating: 0, count: 6), count: 6)
+        var rhs = [Double](repeating: 0, count: 6)
         for m in matches {
-            let p = SIMD3(Double(m.from.x) - cx, Double(m.from.y) - cy, 1)
-            normal += simd_double3x3(columns: (p * p.x, p * p.y, p * p.z))
-            u += p * Double(m.to.x)
-            v += p * Double(m.to.y)
+            let X = Double(m.from.x) - cx, Y = Double(m.from.y) - cy
+            let rows: [[Double]] = [[X, Y, 1, 0, 0, 0], [0, 0, 0, X, Y, 1]]
+            let target = [Double(m.to.x), Double(m.to.y)]
+            let w = m.information
+            for i in 0..<6 {
+                for j in 0..<6 {
+                    for p in 0..<2 {
+                        for q in 0..<2 {
+                            normal[i][j] += rows[p][i] * w[q][p] * rows[q][j]
+                        }
+                    }
+                }
+                for p in 0..<2 {
+                    for q in 0..<2 {
+                        rhs[i] += rows[p][i] * w[q][p] * target[q]
+                    }
+                }
+            }
         }
-        guard abs(normal.determinant) > 1e-6 * pow(normal[0][0] + normal[1][1], 2) else { return nil }
-        let x = normal.inverse * u
-        let y = normal.inverse * v
-        // x' = x.x (X − cx) + x.y (Y − cy) + x.z, likewise y'.
-        return CGAffineTransform(a: x.x, b: y.x, c: x.y, d: y.y,
-                                 tx: x.z - x.x * cx - x.y * cy, ty: y.z - y.x * cx - y.y * cy)
-    }
-
-    /// A patch-sized rect centered at `fraction` of `extent`.
-    private static func anchor(_ fraction: CGPoint, _ extent: CGRect) -> CGRect {
-        let side = CGFloat(correlator.size)
-        return CGRect(x: extent.minX + extent.width * fraction.x - side / 2, y: extent.minY + extent.height * fraction.y - side / 2,
-                      width: side, height: side)
-    }
-
-    /// The middle of `frame` (the image's own extent unless given) at `scale`, exposure-matched, clamped and
-    /// gamma-encoded: green channel, row by row.
-    private static func patch(_ image: CIImage, gain: Double, scale: CGFloat, at frame: CGRect? = nil,
-                              context: CIContext) -> [Float] {
-        let side = correlator.size
-        let small = registrationImage(image, gain: gain, scale: scale)
-        let e = (frame ?? image.extent).applying(CGAffineTransform(scaleX: scale, y: scale))
-        let rect = CGRect(x: (e.midX - CGFloat(side / 2)).rounded(), y: (e.midY - CGFloat(side / 2)).rounded(),
-                          width: CGFloat(side), height: CGFloat(side))
-        var pixels = [SIMD4<Float>](repeating: .zero, count: side * side)
-        pixels.withUnsafeMutableBytes {
-            context.render(small, toBitmap: $0.baseAddress!, rowBytes: side * 16, bounds: rect, format: .RGBAf, colorSpace: nil)
+        // About a sixth of a degree of doubt on the turn, scale and skew.
+        let prior = 1 / (0.003 * 0.003)
+        for (i, identity) in [(0, 1.0), (1, 0.0), (3, 0.0), (4, 1.0)] {
+            normal[i][i] += prior
+            rhs[i] += prior * identity
         }
-        return pixels.map(\.y)
+        guard let x = solve(normal, rhs) else { return nil }
+        return CGAffineTransform(a: x[0], b: x[3], c: x[1], d: x[4],
+                                 tx: x[2] - x[0] * cx - x[1] * cy, ty: x[5] - x[3] * cx - x[4] * cy)
     }
 
-    /// Full-size patches at each of `rects`, side by side in one render: each render waits on the GPU, and on
-    /// the A9 the wait costs more than the patch.
-    private static func patches(_ image: CIImage, gain: Double, at rects: [CGRect], context: CIContext) -> [[Float]] {
-        let side = correlator.size
-        let source = registrationImage(image, gain: gain, scale: 1)
+    /// Gaussian elimination with partial pivoting; nil when singular.
+    private static func solve(_ a: [[Double]], _ b: [Double]) -> [Double]? {
+        var m = a, v = b
+        let n = v.count
+        for col in 0..<n {
+            guard let pivot = (col..<n).max(by: { abs(m[$0][col]) < abs(m[$1][col]) }), abs(m[pivot][col]) > 1e-12 else { return nil }
+            m.swapAt(col, pivot)
+            v.swapAt(col, pivot)
+            for row in (col + 1)..<n {
+                let f = m[row][col] / m[col][col]
+                for k in col..<n {
+                    m[row][k] -= f * m[col][k]
+                }
+                v[row] -= f * v[col]
+            }
+        }
+        var x = [Double](repeating: 0, count: n)
+        for row in stride(from: n - 1, through: 0, by: -1) {
+            var sum = v[row]
+            for k in (row + 1)..<n {
+                sum -= m[row][k] * x[k]
+            }
+            x[row] = sum / m[row][row]
+        }
+        return x
+    }
+
+    private static func middle(_ extent: CGRect) -> CGPoint {
+        CGPoint(x: extent.midX.rounded(), y: extent.midY.rounded())
+    }
+
+    /// The anchor points in `extent`, on whole pixels so every patch lands on the pixel grid.
+    private static func anchorCenters(_ extent: CGRect) -> [CGPoint] {
+        anchors.map { CGPoint(x: (extent.minX + extent.width * $0.x).rounded(), y: (extent.minY + extent.height * $0.y).rounded()) }
+    }
+
+    private struct Tile {
+        var image: CIImage
+        var gain: Double
+        var scale: CGFloat
+        /// In the image's own pixels.
+        var center: CGPoint
+        var blur = 0.0
+    }
+
+    /// Square patches, exposure-matched, clamped and gamma-encoded, green channel row by row: side by side in
+    /// one render, since each render waits on the GPU and on the A9 the wait costs more than the patches.
+    private static func tiles(_ requests: [Tile], side: Int, context: CIContext) -> [[Float]] {
+        guard !requests.isEmpty else { return [] }
         var strip = CIImage.empty()
-        for (i, rect) in rects.enumerated() {
-            let origin = CGPoint(x: rect.midX.rounded() - CGFloat(side / 2), y: rect.midY.rounded() - CGFloat(side / 2))
-            let tile = CGRect(origin: origin, size: CGSize(width: side, height: side))
-            strip = source.cropped(to: tile)
+        for (i, tile) in requests.enumerated() {
+            var source = registrationImage(tile.image, gain: tile.gain, scale: tile.scale)
+            if tile.blur > 0 {
+                source = source.clampedToExtent().applyingGaussianBlur(sigma: tile.blur)
+            }
+            let origin = CGPoint(x: (tile.center.x * tile.scale).rounded() - CGFloat(side / 2),
+                                 y: (tile.center.y * tile.scale).rounded() - CGFloat(side / 2))
+            strip = source.cropped(to: CGRect(origin: origin, size: CGSize(width: side, height: side)))
                 .transformed(by: CGAffineTransform(translationX: CGFloat(i * side) - origin.x, y: -origin.y))
                 .composited(over: strip)
         }
-        let width = side * rects.count
+        let width = side * requests.count
         var pixels = [SIMD4<Float>](repeating: .zero, count: width * side)
         pixels.withUnsafeMutableBytes {
             context.render(strip, toBitmap: $0.baseAddress!, rowBytes: width * 16,
                            bounds: CGRect(x: 0, y: 0, width: width, height: side), format: .RGBAf, colorSpace: nil)
         }
-        var out = [[Float]](repeating: [Float](repeating: 0, count: side * side), count: rects.count)
-        for i in rects.indices {
+        var out = [[Float]](repeating: [Float](repeating: 0, count: side * side), count: requests.count)
+        for i in requests.indices {
             for row in 0..<side {
                 let start = row * width + i * side
                 for x in 0..<side {
